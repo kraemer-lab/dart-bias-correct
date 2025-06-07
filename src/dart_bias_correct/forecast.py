@@ -3,6 +3,7 @@
 import logging
 import itertools
 import functools
+import collections
 import multiprocessing
 from typing import Literal, NamedTuple
 from pathlib import Path
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 # TODO: This is temporary, should be fixed to use geoglue.region
 LATITUDE_SLICE = slice(11.25, 10)
 LONGITUDE_SLICE = slice(106, 107.25)
+# LATITUDE_SLICE = slice(24, 8)
+# LONGITUDE_SLICE = slice(102, 110)
 
 # r = relative_humidity, q = specific_humidity
 INSTANT_VARS = ["t2m", "d2m", "sp", "u10", "v10", "r", "q"]
@@ -28,6 +31,23 @@ ACCUM_VARS = ["tp"]
 SUPPORTED_VARS = INSTANT_VARS + INSTANT_EXTREME_VARS + ACCUM_VARS
 
 BIAS_CORRECT_VARS = ["t2m", "r", "tp"]
+
+
+class GridPoint(NamedTuple):
+    var: str
+    number: int
+    lat_idx: int
+    lon_idx: int
+    time: np.datetime64
+
+
+class GridPointValue(NamedTuple):
+    var: str
+    number: int
+    lat_idx: int
+    lon_idx: int
+    time: np.datetime64
+    value: np.float32
 
 
 def instant_vars(ds: xr.Dataset, include_extremes: bool = False) -> xr.Dataset:
@@ -302,133 +322,74 @@ def get_weekly_forecast(data_raw_forecast: xr.Dataset) -> xr.Dataset:
 
 
 def correct_grid_point(
-    grid_point: tuple[float, float, int],
+    grid_point: tuple[int, int, int, str],
     method: Literal["quantile_mapping", "quantile_delta_mapping"],
     reanalysis: xr.Dataset,
     forecast: xr.Dataset,
     weekly_raw_forecast: xr.Dataset,
-    bool_dataset: xr.Dataset,
+    corrected_coords: set[GridPoint],
     masks: dict[str, list[xr.DataArray]],
     percentile_idx: int,
     percentile_is_extreme: bool,
-) -> tuple[xr.Dataset, xr.Dataset]:
-    la, lo, s = grid_point
+) -> list[GridPointValue]:
+    la, lo, s, var = grid_point
     data_to_corr_or = weekly_raw_forecast.sel(number=s)
-    # Create array of zeros that will be 'corrected' at each grid point using
-    # information from reanalysis, forecast and weekly_raw_forecast
-    # Since each grid point is only corrected once, we can sum the values to
-    # get the corrected forecast
-    corrected_forecast = xr.Dataset(
-        {
-            var: (
-                bool_dataset[var].dims,
-                np.full(bool_dataset[var].shape, 0, dtype=np.float32),
-            )
-            for var in bool_dataset.data_vars
-        },
-        coords=bool_dataset.coords,
+
+    # skip grid point if corrected already
+    t0, t1 = np.array(data_to_corr_or.time.values)
+    p0: GridPoint = var, s, la, lo, t0  # type: ignore
+    p1: GridPoint = var, s, la, lo, t1  # type: ignore
+    if p0 in corrected_coords and p1 in corrected_coords:
+        return []
+
+    kind = "*" if var == "tp" else "+"
+
+    # Identify the lat and lon point where we have reanalysis
+    # data between a specific threshold and locate forecast
+    # data in the same timestamp in the forecast
+    inter_forecast = (
+        forecast[var]
+        .where(masks[var][percentile_idx])
+        .sel(lat=forecast.lat[la], lon=forecast.lon[lo])
+        .dropna(dim="time")
     )
-    # write only bool_dataset
-    # to avoid multiple cores modifying the same dataset, we create a write only
-    # version of of bool_dataset
-    wbool_dataset = xr.Dataset(
-        {
-            var: (
-                bool_dataset[var].dims,
-                np.full(bool_dataset[var].shape, 0, dtype=int),
-            )
-            for var in bool_dataset.data_vars
-        },
-        coords=bool_dataset.coords,
+    inter_reanalysis = (
+        reanalysis[var]
+        .where(masks[var][percentile_idx])
+        .sel(lat=reanalysis.lat[la], lon=reanalysis.lon[lo])
+        .dropna(dim="time")
     )
-    for var in masks:
-        kind = "*" if var == "tp" else "+"
 
-        # Identify the lat and lon point where we have reanalysis
-        # data between a specific threshold and locate forecast
-        # data in the same timestamp in the forecast
-        inter_forecast = (
-            forecast[var]
-            .where(masks[var][percentile_idx])
-            .sel(lat=forecast.lat[la], lon=forecast.lon[lo])
-            .dropna(dim="time")
+    # Get the same latitudinal and longitudinal point for the data to correct
+    data_to_corr = data_to_corr_or[var].sel(
+        lat=data_to_corr_or.lat[la], lon=data_to_corr_or.lon[lo]
+    )
+    # Now, we will search if in the forecast data exists values
+    # of the variable  to correct that are contained inside the
+    # percentile threshold considered in the historical
+    # forecast data (inter_forecast)
+    data_to_corr = data_to_corr.where(
+        (data_to_corr >= inter_forecast.min()) & (data_to_corr < inter_forecast.max()),
+        drop=True,
+    )
+
+    if data_to_corr.size != 0:
+        corr_data = adjust_wrapper_quantiles(
+            method,
+            ADJUST_N_QUANTILES[percentile_is_extreme],
+            inter_reanalysis,
+            inter_forecast,
+            data_to_corr,
+            kind=kind,
         )
-        inter_reanalysis = (
-            reanalysis[var]
-            .where(masks[var][percentile_idx])
-            .sel(lat=reanalysis.lat[la], lon=reanalysis.lon[lo])
-            .dropna(dim="time")
-        )
+    else:
+        return []
 
-        # Get the same latitudinal and longitudinal point for the data to correct
-        data_to_corr = data_to_corr_or[var].sel(
-            lat=data_to_corr_or.lat[la], lon=data_to_corr_or.lon[lo]
-        )
-
-        # Now, we will search if in the forecast data exists values
-        # of the variable  to correct that are contained inside the
-        # percentile threshold considered in the historical
-        # forecast data (inter_forecast)
-        data_to_corr = data_to_corr.where(
-            (data_to_corr >= inter_forecast.min())
-            & (data_to_corr < inter_forecast.max()),
-            drop=True,
-        )
-
-        if data_to_corr.size != 0:
-            corr_data = adjust_wrapper_quantiles(
-                method,
-                ADJUST_N_QUANTILES[percentile_is_extreme],
-                inter_reanalysis,
-                inter_forecast,
-                data_to_corr,
-                kind=kind,
-            )
-        else:
-            continue
-
-        # Now, in the following lines we are checking in the dummy
-        # copy of the dataset if, in the same coordinates the
-        # number is different from 0 if it is, it means that one of
-        # the values that we corrected was already processed, hence
-        # we will delete the repeated value from the correction
-        selected_data = bool_dataset[var].loc[
-            dict(
-                time=data_to_corr.time,
-                number=s,
-                lat=data_to_corr.lat,
-                lon=data_to_corr.lon,
-            )
-        ]
-        filtered_data = selected_data.where(selected_data < 1, drop=True)
-
-        if filtered_data.shape != corr_data[var].shape:
-            # if filtered_data has a different shape from
-            # corr_data, it means that one of the values was
-            # already processed, hence we will filter the repeated
-            # value from the corrected dataset
-            corr_data = corr_data.sel(time=filtered_data.time)
-
-        # Now, we will include the corrected values into the xarray dataset
-        corrected_forecast[var].loc[
-            dict(
-                time=corr_data.time,
-                number=s,
-                lat=corr_data.lat,
-                lon=corr_data.lon,
-            )
-        ] = corr_data[var].values
-
-        # We increase the dummy dataset values by one in the processed coordinates to mark that the specified coordinates was already preprocessed
-        wbool_dataset[var].loc[
-            dict(
-                time=corr_data.time,
-                number=s,
-                lat=corr_data.lat,
-                lon=corr_data.lon,
-            )
-        ] += 1
-    return corrected_forecast, wbool_dataset
+    cvals = corr_data[var].to_numpy()
+    return [
+        GridPointValue(var, s, la, lo, t, np.float32(cvals[i]))
+        for i, t in enumerate(corr_data.time.to_numpy())
+    ]
 
 
 def bias_correct_forecast_parallel(
@@ -476,21 +437,20 @@ def bias_correct_forecast_parallel(
     weekly_raw_forecast = get_weekly_forecast(data_raw_forecast)
     corrected_forecast = weekly_raw_forecast.copy(deep=True)
     corrected_forecast = corrected_forecast[BIAS_CORRECT_VARS]
+    corrected_coords = set()
 
-    # bool_dataset keeps track of lat,lon grid points that have already been
-    # corrected Correction takes place according to percentile values with
-    # extreme values being corrected differently to non-extremal (10-90
-    # percentile) values, see PERCENTILES array
-    bool_dataset = xr.Dataset(
-        {
-            var: (
-                corrected_forecast[var].dims,
-                np.full(corrected_forecast[var].shape, 0, dtype=int),
-            )
-            for var in corrected_forecast.data_vars
-        },
-        coords=corrected_forecast.coords,
-    )
+    def apply_patch(patch: list[GridPointValue]):
+        for var, s, lat_idx, lon_idx, time, value in patch:
+            if (var, s, lat_idx, lon_idx, time) in corrected_coords:
+                continue
+            corrected_forecast[var].loc[
+                {
+                    "time": time,
+                    "number": s,
+                    "lat": corrected_forecast.lat[lat_idx],
+                    "lon": corrected_forecast.lon[lon_idx],
+                }
+            ] = value
 
     for step in [7, 14]:  # 2 weeks in advance
         logger.info("Correction at step=%d", step)
@@ -517,10 +477,10 @@ def bias_correct_forecast_parallel(
                 range(len(forecast.lat)),
                 range(len(forecast.lon)),
                 range(len(data_raw_forecast.number)),
+                BIAS_CORRECT_VARS,
             )
             with multiprocessing.Pool() as pool:
-                corrected_forecast_percentile, ubool_dataset = functools.reduce(
-                    lambda x, y: (x[0] + y[0], x[1] + y[1]),
+                patch: list[GridPointValue] = sum(
                     pool.map(
                         functools.partial(
                             correct_grid_point,
@@ -528,18 +488,18 @@ def bias_correct_forecast_parallel(
                             reanalysis=reanalysis,
                             forecast=forecast,
                             weekly_raw_forecast=weekly_raw_forecast,
-                            bool_dataset=bool_dataset,
+                            corrected_coords=corrected_coords,
                             masks=masks,
                             percentile_idx=m,
                             percentile_is_extreme=PERCENTILES[m].is_extreme,
                         ),
                         grid,
                     ),
+                    [],
                 )
-            bool_dataset = bool_dataset + ubool_dataset
-            corrected_forecast = corrected_forecast_percentile.where(
-                corrected_forecast_percentile != 0, corrected_forecast
-            )
+            apply_patch(patch)
+            # drop value and retrieve corrected GridPoint set so that we don't re-correct them
+            corrected_coords |= set(GridPoint(*x[:-1]) for x in patch)
             logger.info("Finished correction at %r", percentile)
 
     # The bias correction method deletes units for relative humidity so we need to rewrite it
